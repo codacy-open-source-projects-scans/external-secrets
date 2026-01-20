@@ -46,6 +46,12 @@
                 "hostNetwork": {
                     "type": "boolean"
                 },
+                "hostUsers": {
+                    "type": [
+                        "boolean",
+                        "null"
+                    ]
+                },
                 "image": {
                     "type": "object",
                     "properties": {
@@ -296,6 +302,9 @@
                 },
                 "createSecretStore": {
                     "type": "boolean"
+                },
+                "unsafeServeV1Beta1": {
+                    "type": "boolean"
                 }
             }
         },
@@ -416,6 +425,12 @@
         },
         "hostNetwork": {
             "type": "boolean"
+        },
+        "hostUsers": {
+            "type": [
+                "boolean",
+                "null"
+            ]
         },
         "image": {
             "type": "object",
@@ -852,6 +867,12 @@
                 },
                 "hostNetwork": {
                     "type": "boolean"
+                },
+                "hostUsers": {
+                    "type": [
+                        "boolean",
+                        "null"
+                    ]
                 },
                 "image": {
                     "type": "object",
