@@ -4349,6 +4349,16 @@ spec:
                           description: installationID specifies the Github APP installation that will be used to authenticate the client
                           format: int64
                           type: integer
+                        orgSecretVisibility:
+                          description: |-
+                            orgSecretVisibility controls the visibility of organization secrets pushed via PushSecret.
+                            Valid values are "all" or "private".
+                            When unset, new secrets are created with visibility "all" and existing secrets preserve
+                            whatever visibility they already have in GitHub.
+                          enum:
+                            - all
+                            - private
+                          type: string
                         organization:
                           description: organization will be used to fetch secrets from the Github organization
                           type: string
@@ -6897,6 +6907,9 @@ spec:
                                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                       type: string
                                   type: object
+                                vaultRole:
+                                  description: VaultRole specifies the Vault role to use for TLS certificate authentication.
+                                  type: string
                               type: object
                             gcp:
                               description: |-
@@ -16440,6 +16453,16 @@ spec:
                           description: installationID specifies the Github APP installation that will be used to authenticate the client
                           format: int64
                           type: integer
+                        orgSecretVisibility:
+                          description: |-
+                            orgSecretVisibility controls the visibility of organization secrets pushed via PushSecret.
+                            Valid values are "all" or "private".
+                            When unset, new secrets are created with visibility "all" and existing secrets preserve
+                            whatever visibility they already have in GitHub.
+                          enum:
+                            - all
+                            - private
+                          type: string
                         organization:
                           description: organization will be used to fetch secrets from the Github organization
                           type: string
@@ -18988,6 +19011,9 @@ spec:
                                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                       type: string
                                   type: object
+                                vaultRole:
+                                  description: VaultRole specifies the Vault role to use for TLS certificate authentication.
+                                  type: string
                               type: object
                             gcp:
                               description: |-
@@ -26013,6 +26039,9 @@ spec:
                                           pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                           type: string
                                       type: object
+                                    vaultRole:
+                                      description: VaultRole specifies the Vault role to use for TLS certificate authentication.
+                                      type: string
                                   type: object
                                 gcp:
                                   description: |-
@@ -28700,6 +28729,9 @@ spec:
                                   pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                   type: string
                               type: object
+                            vaultRole:
+                              description: VaultRole specifies the Vault role to use for TLS certificate authentication.
+                              type: string
                           type: object
                         gcp:
                           description: |-
