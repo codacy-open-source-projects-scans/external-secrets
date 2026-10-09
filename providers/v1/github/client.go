@@ -34,6 +34,10 @@ import (
 
 const errWriteOnlyProvider = "not implemented - this provider supports write-only operations"
 
+// orgSecretVisibilitySelected is the GitHub org-secret visibility value that
+// restricts the secret to an explicit list of repositories.
+const orgSecretVisibilitySelected = "selected"
+
 // https://github.com/external-secrets/external-secrets/issues/644
 var _ esv1.SecretsClient = &Client{}
 
@@ -47,12 +51,13 @@ type ActionsServiceClient interface {
 	ListOrgSecrets(ctx context.Context, org string, opts *github.ListOptions) (*github.Secrets, *github.Response, error)
 }
 
-// Client implements the External Secrets Kubernetes provider for GitHub Actions secrets.
+// Client implements the External Secrets Kubernetes provider for GitHub Actions or Dependabot secrets.
 type Client struct {
 	crClient         client.Client
 	store            esv1.GenericStore
 	provider         *esv1.GithubProvider
 	baseClient       github.ActionsService
+	dependabotClient github.DependabotService
 	namespace        string
 	storeKind        string
 	repoID           int64
@@ -61,9 +66,12 @@ type Client struct {
 	createOrUpdateFn func(ctx context.Context, eSecret *github.EncryptedSecret) (*github.Response, error)
 	listSecretsFn    func(ctx context.Context) (*github.Secrets, *github.Response, error)
 	deleteSecretFn   func(ctx context.Context, ref esv1.PushSecretRemoteRef) (*github.Response, error)
+	// listSelectedReposFn lists the repo IDs currently granted access to a
+	// "selected"-visibility org secret; nil for repo/env scopes.
+	listSelectedReposFn func(ctx context.Context, name string) (github.SelectedRepoIDs, error)
 }
 
-// DeleteSecret deletes a secret from GitHub Actions.
+// DeleteSecret deletes a secret from the configured GitHub secrets service.
 func (g *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) error {
 	_, err := g.deleteSecretFn(ctx, remoteRef)
 	if err != nil {
@@ -72,7 +80,7 @@ func (g *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 	return nil
 }
 
-// SecretExists checks if a secret exists in GitHub Actions.
+// SecretExists checks if a secret exists in the configured GitHub secrets service.
 func (g *Client) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
 	githubSecret, _, err := g.getSecretFn(ctx, ref)
 	if err != nil {
@@ -84,7 +92,7 @@ func (g *Client) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef)
 	return false, nil
 }
 
-// PushSecret pushes a new secret to GitHub Actions.
+// PushSecret pushes a new secret to the configured GitHub secrets service.
 func (g *Client) PushSecret(ctx context.Context, secret *corev1.Secret, remoteRef esv1.PushSecretData) error {
 	githubSecret, response, err := g.getSecretFn(ctx, remoteRef)
 	if err != nil && (response == nil || response.StatusCode != 404) {
@@ -136,6 +144,19 @@ func (g *Client) PushSecret(ctx context.Context, secret *corev1.Secret, remoteRe
 		Visibility:     visibility,
 	}
 
+	// A "selected"-visibility org secret restricts access to an explicit list
+	// of repositories. GitHub treats an update that omits
+	// selected_repository_ids as "clear all repositories", so without re-sending
+	// the current list an update silently revokes access for every previously
+	// selected repository. Preserve the existing associations on update.
+	if visibility == orgSecretVisibilitySelected && githubSecret != nil && g.listSelectedReposFn != nil {
+		repoIDs, err := g.listSelectedReposFn(ctx, name)
+		if err != nil {
+			return fmt.Errorf("failed to list selected repositories for org secret %q: %w", name, err)
+		}
+		encryptedSecret.SelectedRepositoryIDs = repoIDs
+	}
+
 	if _, err := g.createOrUpdateFn(ctx, encryptedSecret); err != nil {
 		return fmt.Errorf("failed to create secret: %w", err)
 	}
@@ -179,7 +200,7 @@ func (g *Client) Close(_ context.Context) error {
 	return nil
 }
 
-// Validate checks if the client is properly configured and has access to the GitHub Actions API.
+// Validate checks if the client is properly configured and has access to the configured GitHub secrets API.
 func (g *Client) Validate() (esv1.ValidationResult, error) {
 	if g.store.GetKind() == esv1.ClusterSecretStoreKind {
 		return esv1.ValidationResultUnknown, nil

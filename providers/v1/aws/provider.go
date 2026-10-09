@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package aws implements AWS provider interfaces for External Secrets Operator,
-// supporting SecretManager and ParameterStore services.
+// supporting SecretsManager, ParameterStore, and CertificateManager services.
 package aws
 
 import (
@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/acm"
 	awssm "github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,9 +34,11 @@ import (
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	awsauth "github.com/external-secrets/external-secrets/providers/v1/aws/auth"
+	"github.com/external-secrets/external-secrets/providers/v1/aws/certificatemanager"
 	"github.com/external-secrets/external-secrets/providers/v1/aws/parameterstore"
 	"github.com/external-secrets/external-secrets/providers/v1/aws/secretsmanager"
 	awsutil "github.com/external-secrets/external-secrets/providers/v1/aws/util"
+	"github.com/external-secrets/external-secrets/runtime/cache"
 	"github.com/external-secrets/external-secrets/runtime/esutils"
 )
 
@@ -43,7 +46,9 @@ import (
 var _ esv1.Provider = &Provider{}
 
 // Provider satisfies the provider interface.
-type Provider struct{}
+type Provider struct {
+	acmClientCache *cache.Cache[*certificatemanager.CertificateManager]
+}
 
 const (
 	errUnableCreateSession    = "unable to create session: %w"
@@ -51,6 +56,7 @@ const (
 	errRegionNotFound         = "region not found: %s"
 	errInitAWSProvider        = "unable to initialize aws provider: %s"
 	errInvalidSecretsManager  = "invalid SecretsManager settings: %s"
+	acmClientCacheSize        = 100
 )
 
 // Capabilities return the provider supported capabilities (ReadOnly, WriteOnly, ReadWrite).
@@ -60,7 +66,7 @@ func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
 
 // NewClient constructs a new secrets client based on the provided store.
 func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string) (esv1.SecretsClient, error) {
-	return newClient(ctx, store, kube, namespace, awsauth.DefaultSTSProvider)
+	return p.newClient(ctx, store, kube, namespace, awsauth.DefaultSTSProvider)
 }
 
 // ValidateStore validates the configuration of the AWS SecretStore.
@@ -123,6 +129,16 @@ func validateRegion(prov *esv1.AWSProvider) error {
 			return fmt.Errorf(errRegionNotFound, prov.Region)
 		}
 		return nil
+	case esv1.AWSServiceCertificateManager:
+		resolver := acm.NewDefaultEndpointResolverV2()
+		_, err := resolver.ResolveEndpoint(context.TODO(), acm.EndpointParameters{
+			Region:      &prov.Region,
+			ServiceType: aws.String("ACM"),
+		})
+		if err != nil {
+			return fmt.Errorf(errRegionNotFound, prov.Region)
+		}
+		return nil
 	}
 	return fmt.Errorf(errUnknownProviderService, prov.Service)
 }
@@ -137,7 +153,7 @@ func validateSecretsManagerConfig(prov *esv1.AWSProvider) error {
 	})
 }
 
-func newClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string, assumeRoler awsauth.STSProvider) (esv1.SecretsClient, error) {
+func (p *Provider) newClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string, assumeRoler awsauth.STSProvider) (esv1.SecretsClient, error) {
 	prov, err := awsutil.GetAWSProvider(store)
 	if err != nil {
 		return nil, err
@@ -147,6 +163,15 @@ func newClient(ctx context.Context, store esv1.GenericStore, kube client.Client,
 	}
 	storeSpec := store.GetSpec()
 	var cfg *aws.Config
+
+	switch prov.SessionTagsPolicy {
+	case esv1.SessionTagsPolicyNone:
+		// no op
+	case esv1.SessionTagsPolicySimple:
+		prov.SessionTags = buildSessionTags(nil, namespace, store.GetName(), store.GetKind())
+	case esv1.SessionTagsPolicyCustom:
+		prov.SessionTags = buildSessionTags(prov.CustomSessionTags, namespace, store.GetName(), store.GetKind())
+	}
 
 	// allow SecretStore controller validation to pass
 	// when using referent namespace.
@@ -161,6 +186,8 @@ func newClient(ctx context.Context, store esv1.GenericStore, kube client.Client,
 			return secretsmanager.New(ctx, &cfg, prov.SecretsManager, storeSpec.Provider.AWS.Prefix, true, kube, namespace)
 		case esv1.AWSServiceParameterStore:
 			return parameterstore.New(ctx, &cfg, storeSpec.Provider.AWS.Prefix, true)
+		case esv1.AWSServiceCertificateManager:
+			return p.newACMClient(ctx, store, namespace, &cfg, storeSpec.Provider.AWS.Prefix, true)
 		}
 		return nil, fmt.Errorf(errUnknownProviderService, prov.Service)
 	}
@@ -216,8 +243,61 @@ func newClient(ctx context.Context, store esv1.GenericStore, kube client.Client,
 		return secretsmanager.New(ctx, cfg, prov.SecretsManager, storeSpec.Provider.AWS.Prefix, false, kube, namespace)
 	case esv1.AWSServiceParameterStore:
 		return parameterstore.New(ctx, cfg, storeSpec.Provider.AWS.Prefix, false)
+	case esv1.AWSServiceCertificateManager:
+		return p.newACMClient(ctx, store, namespace, cfg, storeSpec.Provider.AWS.Prefix, false)
 	}
 	return nil, fmt.Errorf(errUnknownProviderService, prov.Service)
+}
+
+func (p *Provider) newACMClient(ctx context.Context, store esv1.GenericStore, namespace string, cfg *aws.Config, prefix string, referentAuth bool) (*certificatemanager.CertificateManager, error) {
+	if p.acmClientCache == nil {
+		return certificatemanager.New(ctx, cfg, prefix, referentAuth)
+	}
+
+	key := cache.Key{
+		Name:      store.GetObjectMeta().Name,
+		Namespace: namespace,
+		Kind:      store.GetTypeMeta().Kind,
+	}
+
+	if cachedClient, ok := p.acmClientCache.Get(store.GetObjectMeta().ResourceVersion, key); ok {
+		return cachedClient, nil
+	}
+
+	client, err := certificatemanager.New(ctx, cfg, prefix, referentAuth)
+	if err != nil {
+		return nil, err
+	}
+
+	p.acmClientCache.Add(store.GetObjectMeta().ResourceVersion, key, client)
+
+	return client, nil
+}
+
+// buildSessionTags constructs a list of session tags for the AWS STS session.
+// It always includes the esoNamespace and esoStoreName tags.
+// When customTags is provided (Custom mode), those are merged in as well.
+func buildSessionTags(customTags map[string]string, namespace, storeName, storeKind string) []*esv1.Tag {
+	m := make(map[string]string)
+
+	for k, v := range customTags {
+		if k != "" && v != "" {
+			m[k] = v
+		}
+	}
+	m["esoNamespace"] = namespace
+	m["esoStoreName"] = storeName
+	m["esoStoreKind"] = storeKind
+
+	newTags := make([]*esv1.Tag, 0, len(m))
+	for k, v := range m {
+		newTags = append(newTags, &esv1.Tag{
+			Key:   k,
+			Value: v,
+		})
+	}
+
+	return newTags
 }
 
 // Add this type at package level.
@@ -231,7 +311,9 @@ func (f fixedDelayer) BackoffDelay(int, error) (time.Duration, error) {
 
 // NewProvider creates a new AWS Provider instance.
 func NewProvider() esv1.Provider {
-	return &Provider{}
+	return &Provider{
+		acmClientCache: cache.Must[*certificatemanager.CertificateManager](acmClientCacheSize, nil),
+	}
 }
 
 // ProviderSpec returns the provider specification for registration.

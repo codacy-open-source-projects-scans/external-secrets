@@ -22,18 +22,24 @@ When you create a new external-secret object, the External Secrets webhook provi
 
 * Bitwarden account (it also works with Vaultwarden!)
 * A Kubernetes secret which contains your Bitwarden credentials
-* A Docker image running the Bitwarden CLI. You could use `ghcr.io/charlesthomas/bitwarden-cli:2023.12.1` or build your own.
+* A Docker image running the Bitwarden CLI. You could use `ghcr.io/charlesthomas/bitwarden-cli:2026.3.0` or build your own.
 
 Here is an example of a Dockerfile used to build the image:
 ```dockerfile
 FROM debian:sid
 
-ENV BW_CLI_VERSION=2023.12.1
+ARG BW_CLI_VERSION=2025.12.1
+ARG TARGETARCH
 
 RUN apt update && \
     apt install -y wget unzip && \
-    wget https://github.com/bitwarden/clients/releases/download/cli-v${BW_CLI_VERSION}/bw-linux-${BW_CLI_VERSION}.zip && \
-    unzip bw-linux-${BW_CLI_VERSION}.zip && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      BW_ARCH="-arm64"; \
+    else \
+      BW_ARCH=""; \
+    fi && \
+    wget https://github.com/bitwarden/clients/releases/download/cli-v${BW_CLI_VERSION}/bw-oss-linux${BW_ARCH}-${BW_CLI_VERSION}.zip && \
+    unzip bw-oss-linux${BW_ARCH}-${BW_CLI_VERSION}.zip && \
     chmod +x bw && \
     mv bw /usr/local/bin/bw && \
     rm -rfv *.zip
@@ -63,8 +69,42 @@ fi
 bw unlock --check
 
 echo 'Running `bw server` on port 8087'
-bw serve --hostname 0.0.0.0 #--disable-origin-protection
+bw serve --hostname all
 ```
+
+!!! warning "Bitwarden CLI 2026.6.0 and later: use `--hostname all`"
+
+    `bw serve` 2026.6.0 added a Host header allowlist on top of its existing
+    Origin header check. With `--hostname 0.0.0.0` the allowlist is built from
+    the bound hostname, so it contains only `localhost:8087`, `127.0.0.1:8087`,
+    `[::1]:8087` and `0.0.0.0:8087`.
+
+    The webhook provider sends whatever authority the SecretStore `url` carries
+    as the `Host` header. For a store pointing at
+    `http://bitwarden-cli.bitwarden.svc:8087` that authority is not on the
+    allowlist, so `bw serve` answers `403` and logs:
+
+    ```
+    Blocking request with disallowed Host "bitwarden-cli.bitwarden.svc:8087"
+    ```
+
+    Every ExternalSecret backed by these stores fails.
+
+    `--hostname all` binds every interface and skips the Host allowlist, which
+    is why the example above uses it. It is also accepted by older releases, so
+    the same entrypoint works either way.
+
+    Prefer this over `--disable-origin-protection`. That flag turns off the
+    Origin header check as well, whereas `--hostname all` leaves it in place.
+    The webhook provider does not send an `Origin` header, so it is unaffected.
+
+    Pinning the Host from the store does not work as a substitute. Entries in
+    the store's `headers` are applied with `Header.Add`, and Go takes the
+    request Host from the URL rather than from `Header["Host"]`, so a
+    `Host: localhost:8087` header is silently ignored.
+
+    Neither option authenticates callers. The NetworkPolicy below is what
+    restricts access to `bw serve`, so deploy it.
 
 ## Deploy Bitwarden credentials
 

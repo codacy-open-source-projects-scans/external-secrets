@@ -23,6 +23,7 @@ import (
 
 	"github.com/DelineaXPM/tss-sdk-go/v3/server"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	kubeErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +32,7 @@ import (
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+	"github.com/external-secrets/external-secrets/runtime/esutils"
 )
 
 func TestDoesConfigDependOnNamespace(t *testing.T) {
@@ -62,6 +64,44 @@ func TestDoesConfigDependOnNamespace(t *testing.T) {
 				Password: &esv1.SecretServerProviderRef{SecretRef: nil},
 			},
 			want: false,
+		},
+		"true when Token references a secret without explicit namespace": {
+			cfg: esv1.SecretServerProvider{
+				Token: &esv1.SecretServerProviderRef{
+					SecretRef: &v1.SecretKeySelector{Name: "foo"},
+				},
+			},
+			want: true,
+		},
+		"false when Token uses a direct value": {
+			cfg: esv1.SecretServerProvider{
+				Token: &esv1.SecretServerProviderRef{Value: "foo"},
+			},
+			want: false,
+		},
+		"false when Token has explicit namespace even if Username ref lacks one": {
+			// Token takes precedence, so the ignored Username ref must not
+			// introduce a namespace dependency.
+			cfg: esv1.SecretServerProvider{
+				Token: &esv1.SecretServerProviderRef{
+					SecretRef: &v1.SecretKeySelector{Name: "foo", Namespace: new("ns")},
+				},
+				Username: &esv1.SecretServerProviderRef{
+					SecretRef: &v1.SecretKeySelector{Name: "bar"},
+				},
+			},
+			want: false,
+		},
+		"true when Token ref lacks a namespace even if Username has one": {
+			cfg: esv1.SecretServerProvider{
+				Token: &esv1.SecretServerProviderRef{
+					SecretRef: &v1.SecretKeySelector{Name: "foo"},
+				},
+				Username: &esv1.SecretServerProviderRef{
+					SecretRef: &v1.SecretKeySelector{Name: "bar", Namespace: new("ns")},
+				},
+			},
+			want: true,
 		},
 	}
 	for name, tc := range tests {
@@ -113,7 +153,7 @@ func TestValidateStore(t *testing.T) {
 				Password:  validSecretRefUsingValue,
 				ServerURL: testURL,
 			},
-			want: errSecretRefAndValueConflict,
+			want: esutils.ErrValueAndRefConflict,
 		},
 		"invalid with ambiguous Password": {
 			cfg: esv1.SecretServerProvider{
@@ -121,7 +161,7 @@ func TestValidateStore(t *testing.T) {
 				Password:  ambiguousSecretRef,
 				ServerURL: testURL,
 			},
-			want: errSecretRefAndValueConflict,
+			want: esutils.ErrValueAndRefConflict,
 		},
 		"invalid with invalid Username": {
 			cfg: esv1.SecretServerProvider{
@@ -129,7 +169,7 @@ func TestValidateStore(t *testing.T) {
 				Password:  validSecretRefUsingValue,
 				ServerURL: testURL,
 			},
-			want: errSecretRefAndValueMissing,
+			want: esutils.ErrValueOrRefMissing,
 		},
 		"invalid with invalid Password": {
 			cfg: esv1.SecretServerProvider{
@@ -137,7 +177,7 @@ func TestValidateStore(t *testing.T) {
 				Password:  makeSecretRefUsingValue(""),
 				ServerURL: testURL,
 			},
-			want: errSecretRefAndValueMissing,
+			want: esutils.ErrValueOrRefMissing,
 		},
 		"valid with tenant/clientID/clientSecret": {
 			cfg: esv1.SecretServerProvider{
@@ -146,6 +186,42 @@ func TestValidateStore(t *testing.T) {
 				ServerURL: testURL,
 			},
 			want: nil,
+		},
+		"valid with token and no username/password": {
+			cfg: esv1.SecretServerProvider{
+				Token:     validSecretRefUsingValue,
+				ServerURL: testURL,
+			},
+			want: nil,
+		},
+		"invalid without serverURL when using token": {
+			cfg: esv1.SecretServerProvider{
+				Token: validSecretRefUsingValue,
+				/*ServerURL: testURL,*/
+			},
+			want: errEmptyServerURL,
+		},
+		"invalid with ambiguous token": {
+			cfg: esv1.SecretServerProvider{
+				Token:     ambiguousSecretRef,
+				ServerURL: testURL,
+			},
+			want: esutils.ErrValueAndRefConflict,
+		},
+		"invalid with invalid token": {
+			cfg: esv1.SecretServerProvider{
+				Token:     makeSecretRefUsingValue(""),
+				ServerURL: testURL,
+			},
+			want: esutils.ErrValueOrRefMissing,
+		},
+		"invalid with zero site ID": {
+			cfg: esv1.SecretServerProvider{
+				Token:     validSecretRefUsingValue,
+				ServerURL: testURL,
+				SiteID:    new(0),
+			},
+			want: errInvalidSiteID,
 		},
 	}
 	for name, tc := range tests {
@@ -164,18 +240,94 @@ func TestValidateStore(t *testing.T) {
 	}
 }
 
+func TestNewClientSiteIDConfiguration(t *testing.T) {
+	newProvider := func(siteID *int, disableValidation bool) *esv1.SecretServerProvider {
+		return &esv1.SecretServerProvider{
+			Token:                   makeSecretRefUsingValue("token"),
+			ServerURL:               "https://example.com",
+			SiteID:                  siteID,
+			DisableSiteIDValidation: disableValidation,
+		}
+	}
+
+	tests := map[string]struct {
+		store        esv1.GenericStore
+		wantSiteID   int
+		wantDisabled bool
+	}{
+		"SecretStore uses default": {
+			store: &esv1.SecretStore{
+				TypeMeta: metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{
+					SecretServer: newProvider(nil, false),
+				}},
+			},
+			wantSiteID: defaultSiteID,
+		},
+		"SecretStore uses configured value": {
+			store: &esv1.SecretStore{
+				TypeMeta: metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{
+					SecretServer: newProvider(new(7), false),
+				}},
+			},
+			wantSiteID: 7,
+		},
+		"ClusterSecretStore uses configured value": {
+			store: &esv1.ClusterSecretStore{
+				TypeMeta: metav1.TypeMeta{Kind: esv1.ClusterSecretStoreKind},
+				Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{
+					SecretServer: newProvider(new(9), false),
+				}},
+			},
+			wantSiteID: 9,
+		},
+		"disabled validation preserves missing value": {
+			store: &esv1.SecretStore{
+				TypeMeta: metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				Spec: esv1.SecretStoreSpec{Provider: &esv1.SecretStoreProvider{
+					SecretServer: newProvider(nil, true),
+				}},
+			},
+			wantDisabled: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			provider := &Provider{}
+			secretsClient, err := provider.NewClient(t.Context(), tc.store, clientfake.NewClientBuilder().Build(), "default")
+			require.NoError(t, err)
+
+			secretServerClient, ok := secretsClient.(*client)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantSiteID, secretServerClient.siteID)
+			assert.Equal(t, tc.wantDisabled, secretServerClient.disableSiteIDValidation)
+		})
+	}
+}
+
 func TestNewClient(t *testing.T) {
 	userNameKey := "username"
 	userNameValue := "foo"
 	passwordKey := passwordSlug
 	passwordValue := generateRandomString()
 	domain := "domain1"
+	tokenKey := "token"
+	tokenValue := generateRandomString()
 
 	clientSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
 		Data: map[string][]byte{
 			userNameKey: []byte(userNameValue),
 			passwordKey: []byte(passwordValue),
+		},
+	}
+
+	tokenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "token-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			tokenKey: []byte(tokenValue),
 		},
 	}
 
@@ -331,6 +483,30 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 				ServerURL: validProvider.ServerURL,
 			},
 			kube: clientfake.NewClientBuilder().WithObjects(clientSecret).Build(),
+		},
+		"valid token via value": {
+			provider: &esv1.SecretServerProvider{
+				Token:     makeSecretRefUsingValue(tokenValue),
+				ServerURL: validProvider.ServerURL,
+			},
+			kube: clientfake.NewClientBuilder().Build(),
+		},
+		"valid token via secret ref": {
+			provider: &esv1.SecretServerProvider{
+				Token:     makeSecretRefUsingRef(tokenSecret.Name, tokenKey),
+				ServerURL: validProvider.ServerURL,
+			},
+			kube: clientfake.NewClientBuilder().WithObjects(tokenSecret).Build(),
+		},
+		"dangling token ref": {
+			provider: &esv1.SecretServerProvider{
+				Token:     makeSecretRefUsingRef("typo", tokenKey),
+				ServerURL: validProvider.ServerURL,
+			},
+			kube: clientfake.NewClientBuilder().WithObjects(tokenSecret).Build(),
+			errCheck: func(t *testing.T, err error) {
+				assert.True(t, kubeErrors.IsNotFound(err))
+			},
 		},
 		"cluster secret store": {
 			store: &esv1.ClusterSecretStore{
@@ -508,8 +684,11 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 					Username: userNameValue,
 					Password: passwordValue,
 				}
-				if name == "cluster secret store with domain" {
+				switch name {
+				case "cluster secret store with domain":
 					expectedCredentials.Domain = domain
+				case "valid token via value", "valid token via secret ref":
+					expectedCredentials = server.UserCredential{Token: tokenValue}
 				}
 				assert.Equal(t, expectedCredentials, secretServerClient.Configuration.Credentials)
 			} else {
@@ -612,7 +791,7 @@ func TestValidateStoreSecretRef(t *testing.T) {
 				},
 				Value: "some-value",
 			},
-			wantErr: errSecretRefAndValueConflict,
+			wantErr: esutils.ErrValueAndRefConflict,
 		},
 	}
 
@@ -626,6 +805,37 @@ func TestValidateStoreSecretRef(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadConfigSecretReferentValidation ensures the credential-loading path
+// enforces esutils referent validation. A namespaced SecretStore must not be
+// able to resolve a secret that lives in a different namespace, even if that
+// secret exists — this is the exfiltration guard.
+func TestLoadConfigSecretReferentValidation(t *testing.T) {
+	const storeNamespace = "default"
+	const otherNamespace = "other-ns"
+
+	// A secret in a namespace the store must NOT be allowed to read.
+	stolenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "stolen", Namespace: otherNamespace},
+		Data:       map[string][]byte{"token": []byte("super-secret")},
+	}
+	kube := clientfake.NewClientBuilder().WithObjects(stolenSecret).Build()
+
+	// Namespaced SecretStore living in storeNamespace.
+	store := &esv1.SecretStore{
+		TypeMeta:   metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+		ObjectMeta: metav1.ObjectMeta{Namespace: storeNamespace},
+	}
+
+	// Token ref that tries to reach into the other namespace.
+	ref := makeSecretRefUsingNamespacedRef(otherNamespace, stolenSecret.Name, "token")
+
+	val, err := loadConfigSecret(context.Background(), store, ref, kube, storeNamespace)
+
+	assert.Error(t, err)
+	assert.Empty(t, val, "guard must block resolution before the value is read")
+	assert.ErrorContains(t, err, "namespace should either be empty or match")
 }
 
 // TestCapabilities tests the Capabilities function.

@@ -48,6 +48,10 @@ const (
 	// folderPrefix is the prefix used to encode a folder ID in a remote key.
 	// Format: "folderId:<id>/<name>" (e.g. "folderId:73/my-secret").
 	folderPrefix = "folderId:"
+	// validateSearchText is intentionally unlikely to match a real secret. The
+	// Secret Server search call authenticates the client and returns an empty
+	// result set when no records match.
+	validateSearchText = "external-secrets-validation-check"
 )
 
 // isNotFoundError checks if an error indicates a secret was not found.
@@ -132,10 +136,16 @@ func parseFolderPrefix(key string) (folderID int, name string, hasFolderPrefix b
 type PushSecretMetadataSpec struct {
 	FolderID         int `json:"folderId"`
 	SecretTemplateID int `json:"secretTemplateId"`
+	// SiteID overrides the site ID from the SecretStore for one secret.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	SiteID *int `json:"siteId,omitempty"`
 }
 
 type client struct {
-	api secretAPI
+	api                     secretAPI
+	siteID                  int
+	disableSiteIDValidation bool
 }
 
 var _ esv1.SecretsClient = &client{}
@@ -237,17 +247,37 @@ func (c *client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 	}
 
 	if meta == nil || meta.Spec.SecretTemplateID <= 0 {
-		return errors.New("folderId and secretTemplateId must be provided in metadata to create a new secret")
+		return errors.New("folderId and secretTemplateId must be set in metadata to create a secret")
 	}
 
 	// Use the effective folderID (prefix-overridden or metadata-supplied) for creation.
 	if folderID <= 0 {
-		return errors.New("folderId and secretTemplateId must be provided in metadata to create a new secret")
+		return errors.New("folderId and secretTemplateId must be set in metadata to create a secret")
+	}
+
+	siteID, err := c.resolveSiteID(meta.Spec.SiteID)
+	if err != nil {
+		return err
 	}
 
 	createSpec := meta.Spec
 	createSpec.FolderID = folderID
-	return c.createSecret(data.GetRemoteKey(), data.GetProperty(), string(value), createSpec)
+	return c.createSecret(data.GetRemoteKey(), data.GetProperty(), string(value), createSpec, siteID)
+}
+
+func (c *client) resolveSiteID(metadataSiteID *int) (int, error) {
+	if metadataSiteID != nil {
+		if *metadataSiteID <= 0 {
+			return 0, errors.New("siteId must be greater than zero")
+		}
+		return *metadataSiteID, nil
+	}
+
+	if c.siteID > 0 || c.disableSiteIDValidation {
+		return c.siteID, nil
+	}
+
+	return 0, errors.New("siteId must be set in PushSecret metadata or SecretStore configuration")
 }
 
 // updateSecret updates an existing secret in Delinea Secret Server.
@@ -283,7 +313,7 @@ func (c *client) updateSecret(secret *server.Secret, property, value string) err
 // createSecret creates a new secret in Delinea Secret Server.
 // Only the targeted field is populated; other required template fields
 // may cause an API error.
-func (c *client) createSecret(name, property, value string, meta PushSecretMetadataSpec) error {
+func (c *client) createSecret(name, property, value string, meta PushSecretMetadataSpec, siteID int) error {
 	template, err := c.api.SecretTemplate(meta.SecretTemplateID)
 	if err != nil {
 		return fmt.Errorf("failed to get secret template: %w", err)
@@ -315,6 +345,7 @@ func (c *client) createSecret(name, property, value string, meta PushSecretMetad
 	newSecret := server.Secret{
 		Name:             normalizedName,
 		FolderID:         meta.FolderID,
+		SiteID:           siteID,
 		SecretTemplateID: meta.SecretTemplateID,
 		Fields:           make([]server.SecretField, 0),
 	}
@@ -377,14 +408,33 @@ func (c *client) SecretExists(_ context.Context, ref esv1.PushSecretRemoteRef) (
 	return true, nil
 }
 
-// Validate not supported at this time.
 func (c *client) Validate() (esv1.ValidationResult, error) {
+	if c.api == nil {
+		return esv1.ValidationResultError, errors.New("secret server API client is not initialized")
+	}
+	if _, err := c.api.Secrets(validateSearchText, "Name"); err != nil {
+		return esv1.ValidationResultError, fmt.Errorf("failed to validate Secret Server credentials: %w", err)
+	}
 	return esv1.ValidationResultReady, nil
 }
 
 // GetSecretMap retrieves the secret referenced by ref from the Secret Server API
 // and returns it as a map of byte slices.
 func (c *client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	// When a property is requested, GetSecret already fetches the secret and
+	// applies its own empty-fields guard, so resolve it here and avoid the
+	// second round-trip a separate getSecret call would incur.
+	if ref.Property != "" {
+		value, err := c.GetSecret(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		if data, ok, err := jsonObjectToByteMap(string(value)); ok || err != nil {
+			return data, err
+		}
+		return map[string][]byte{ref.Property: value}, nil
+	}
+
 	secret, err := c.getSecret(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -394,21 +444,55 @@ func (c *client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 		return nil, errors.New("secret contains no fields")
 	}
 
-	secretData := make(map[string]any)
+	if data, ok, err := jsonObjectToByteMap(secret.Fields[0].ItemValue); ok || err != nil {
+		return data, err
+	}
 
-	err = json.Unmarshal([]byte(secret.Fields[0].ItemValue), &secretData)
+	return fieldsToByteMap(secret.Fields)
+}
+
+func jsonObjectToByteMap(value string) (map[string][]byte, bool, error) {
+	trimmed := strings.TrimSpace(value)
+	// Require a valid JSON object: gating on validity (not just a leading "{")
+	// means a value that merely starts with "{" but is not valid JSON falls
+	// through to the plain-text/field-map path instead of hard-failing, so the
+	// json.Unmarshal error below is effectively defensive only.
+	if !strings.HasPrefix(trimmed, "{") || !gjson.Valid(trimmed) {
+		return nil, false, nil
+	}
+
+	secretData := make(map[string]any)
+	err := json.Unmarshal([]byte(value), &secretData)
 	if err != nil {
 		// Do not return the raw error as json.Unmarshal errors may contain
 		// sensitive secret data in the error message
-		return nil, errors.New("failed to unmarshal secret: invalid JSON format")
+		return nil, true, errors.New("failed to unmarshal secret: invalid JSON format")
 	}
 
 	data := make(map[string][]byte)
-	for k, v := range secretData {
-		data[k], err = esutils.GetByteValue(v)
+	for k := range secretData {
+		data[k], err = esutils.GetByteValueFromMap(secretData, k)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
+	}
+	return data, true, nil
+}
+
+func fieldsToByteMap(fields []server.SecretField) (map[string][]byte, error) {
+	data := make(map[string][]byte, len(fields))
+	for _, field := range fields {
+		key := field.Slug
+		if key == "" {
+			key = field.FieldName
+		}
+		if key == "" && field.FieldID > 0 {
+			key = strconv.Itoa(field.FieldID)
+		}
+		if key == "" {
+			return nil, errors.New("secret field has no slug, field name, or field ID")
+		}
+		data[key] = []byte(field.ItemValue)
 	}
 	return data, nil
 }

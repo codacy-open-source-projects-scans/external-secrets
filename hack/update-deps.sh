@@ -8,6 +8,7 @@ set -euo pipefail
 # - APIs module
 # - Runtime module
 # - E2E module
+# - Build tools module
 # - All provider modules (providers/v1/*)
 # - All generator modules (generators/v1/*)
 #
@@ -42,13 +43,14 @@ warn() {
 }
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $*"
+    echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
 # Update a single module's dependencies
 update_module() {
     local module_path="$1"
     local module_name="$2"
+    local package_pattern="${3:-.}"
     
     info "Updating dependencies for $module_name..."
     
@@ -56,7 +58,7 @@ update_module() {
     
     # Run go get -u to update dependencies
     # Some updates may fail due to dependency constraints - this is expected
-    if go get -u 2>&1; then
+    if go get -u "$package_pattern" 2>&1; then
         success "Updated dependencies for $module_name"
     else
         warn "Failed to update some dependencies for $module_name (continuing...)"
@@ -104,10 +106,21 @@ main() {
     fi
     echo ""
     
-    # 5. Update all provider modules
+    # 5. Update build tools module
+    if ! update_module "hack/tools" "build tools" tool; then
+        failed_modules+=("build tools")
+    fi
+    echo ""
+
+    if ! update_module "hack/tools/gen-crd-api-reference-docs" "gen-crd-api-reference-docs" tool; then
+        failed_modules+=("gen-crd-api-reference-docs")
+    fi
+    echo ""
+
+    # 6. Update all provider modules
     info "Updating provider modules..."
     for provider_dir in "$REPO_ROOT"/providers/v1/*/; do
-        if [ -f "$provider_dir/go.mod" ]; then
+        if [[ -f "$provider_dir/go.mod" ]]; then
             provider_name=$(basename "$provider_dir")
             relative_path="providers/v1/$provider_name"
             if ! update_module "$relative_path" "provider/$provider_name"; then
@@ -117,10 +130,10 @@ main() {
     done
     echo ""
     
-    # 6. Update all generator modules
+    # 7. Update all generator modules
     info "Updating generator modules..."
     for generator_dir in "$REPO_ROOT"/generators/v1/*/; do
-        if [ -f "$generator_dir/go.mod" ]; then
+        if [[ -f "$generator_dir/go.mod" ]]; then
             generator_name=$(basename "$generator_dir")
             relative_path="generators/v1/$generator_name"
             if ! update_module "$relative_path" "generator/$generator_name"; then
@@ -132,7 +145,7 @@ main() {
     
     # Summary
     echo "=================================================="
-    if [ ${#failed_modules[@]} -eq 0 ]; then
+    if [[ ${#failed_modules[@]} -eq 0 ]]; then
         success "All modules updated successfully!"
     else
         warn "Some modules encountered issues during update:"
@@ -149,4 +162,3 @@ main() {
 
 # Run main function
 main
-

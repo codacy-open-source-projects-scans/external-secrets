@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+	"github.com/external-secrets/external-secrets/runtime/cache"
 	"github.com/external-secrets/external-secrets/runtime/esutils"
 	"github.com/external-secrets/external-secrets/runtime/find"
 )
@@ -60,7 +61,9 @@ var _ esv1.SecretsClient = &Akeyless{}
 var _ esv1.Provider = &Provider{}
 
 // Provider satisfies the provider interface.
-type Provider struct{}
+type Provider struct {
+	clientCache *cache.Cache[esv1.SecretsClient]
+}
 
 // akeylessBase satisfies the provider.SecretsClient interface.
 type akeylessBase struct {
@@ -71,6 +74,7 @@ type akeylessBase struct {
 	namespace string
 
 	akeylessGwAPIURL string
+	ignoreCache      bool
 	RestAPI          *akeyless.V2ApiService
 }
 
@@ -78,13 +82,6 @@ type akeylessBase struct {
 type Akeyless struct {
 	Client akeylessVaultInterface
 	url    string
-}
-
-// Item represents an item in the Akeyless Vault.
-type Item struct {
-	ItemName    string `json:"item_name"`
-	ItemType    string `json:"item_type"`
-	LastVersion int32  `json:"last_version"`
 }
 
 type akeylessVaultInterface interface {
@@ -99,11 +96,20 @@ type akeylessVaultInterface interface {
 
 // Capabilities return the provider supported capabilities (ReadOnly, WriteOnly, ReadWrite).
 func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
-	return esv1.SecretStoreReadOnly
+	return esv1.SecretStoreReadWrite
 }
 
 // NewClient constructs a new secrets client based on the provided store.
 func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string) (esv1.SecretsClient, error) {
+	key := cache.Key{
+		Name:      store.GetObjectMeta().Name,
+		Namespace: namespace,
+		Kind:      store.GetKind(),
+	}
+	if cachedClient, ok := p.clientCache.Get(store.GetObjectMeta().ResourceVersion, key); ok {
+		return cachedClient, nil
+	}
+
 	// controller-runtime/client does not support TokenRequest or other subresource APIs
 	// so we need to construct our own client and use it to fetch tokens
 	// (for Kubernetes service account token auth)
@@ -116,7 +122,13 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 		return nil, err
 	}
 
-	return newClient(ctx, store, kube, clientset.CoreV1(), namespace)
+	client, err := newClient(ctx, store, kube, clientset.CoreV1(), namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	p.clientCache.Add(store.GetObjectMeta().ResourceVersion, key, client)
+	return client, nil
 }
 
 // ValidateStore validates the configuration of the Akeyless provider in the store.
@@ -180,9 +192,16 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 	}
 
 	accessTypeParam := akeylessSpec.Auth.SecretRef.AccessTypeParam
-	err = esutils.ValidateSecretSelector(store, accessTypeParam)
-	if err != nil {
-		return nil, err
+	if accessTypeParam.Name != "" {
+		if err := esutils.ValidateSecretSelector(store, accessTypeParam); err != nil {
+			return nil, err
+		}
+	}
+
+	if akeylessSpec.Auth.ServiceAccountRef != nil {
+		if err := esutils.ValidateReferentServiceAccountSelector(store, *akeylessSpec.Auth.ServiceAccountRef); err != nil {
+			return nil, fmt.Errorf("invalid Auth.ServiceAccountRef: %w", err)
+		}
 	}
 
 	return nil, nil
@@ -225,12 +244,13 @@ func newClient(ctx context.Context, store esv1.GenericStore, kube client.Client,
 	}).V2Api
 
 	akl.akeylessGwAPIURL = akeylessGwAPIURL
+	akl.ignoreCache = ignoreCacheEnabled(spec)
 	akl.RestAPI = RestAPIClient
 	return &Akeyless{Client: akl, url: akeylessGwAPIURL}, nil
 }
 
 func (a *Akeyless) contextWithToken(ctx context.Context) (context.Context, error) {
-	if v := ctx.Value(aKeylessToken); v != nil {
+	if ctx.Value(aKeylessToken) != nil {
 		return ctx, nil
 	}
 	token, err := a.Client.TokenFromSecretRef(ctx)
@@ -275,6 +295,9 @@ func (a *Akeyless) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRem
 		}
 	}
 	value, err := a.Client.GetSecretByType(ctx, ref.Key, version)
+	if errors.Is(err, ErrItemNotExists) {
+		return nil, esv1.NoSecretErr
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -395,22 +418,16 @@ func (a *Akeyless) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretData
 	if esutils.IsNil(a.Client) {
 		return nil, errors.New(errUninitalizedAkeylessProvider)
 	}
-	val, err := a.GetSecret(ctx, ref)
+	data, err := a.GetSecret(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	// Maps the json data to a string:string map
-	kv := make(map[string]string)
-	err = json.Unmarshal(val, &kv)
+
+	secretData, err := esutils.JSONToSecretDataMap(data)
 	if err != nil {
 		return nil, fmt.Errorf(errJSONSecretUnmarshal, err)
 	}
 
-	// Converts values in K:V pairs into bytes, while leaving keys as strings
-	secretData := make(map[string][]byte)
-	for k, v := range kv {
-		secretData[k] = []byte(v)
-	}
 	return secretData, nil
 }
 
@@ -420,7 +437,7 @@ func (a *Akeyless) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRe
 		return false, errors.New(errUninitalizedAkeylessProvider)
 	}
 	secret, err := a.GetSecret(ctx, esv1.ExternalSecretDataRemoteRef{Key: ref.GetRemoteKey()})
-	if errors.Is(err, ErrItemNotExists) {
+	if errors.Is(err, esv1.NoSecretErr) {
 		return false, nil
 	}
 	if err != nil {
@@ -458,7 +475,7 @@ func (a *Akeyless) PushSecret(ctx context.Context, secret *corev1.Secret, psd es
 		return err
 	}
 	secretRemote, err := a.GetSecret(ctx, esv1.ExternalSecretDataRemoteRef{Key: psd.GetRemoteKey()})
-	isNotExists := errors.Is(err, ErrItemNotExists)
+	isNotExists := errors.Is(err, esv1.NoSecretErr)
 	if err != nil && !isNotExists {
 		return err
 	}
@@ -571,7 +588,9 @@ func (a *akeylessBase) getAkeylessHTTPClient(ctx context.Context, provider *esv1
 
 // NewProvider creates a new Provider instance.
 func NewProvider() esv1.Provider {
-	return &Provider{}
+	return &Provider{
+		clientCache: cache.Must[esv1.SecretsClient](100, nil),
+	}
 }
 
 // ProviderSpec returns the provider specification for registration.

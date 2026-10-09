@@ -24,15 +24,12 @@ import (
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	"github.com/external-secrets/external-secrets/pkg/controllers/templating"
-	"github.com/external-secrets/external-secrets/runtime/esutils"
 	"github.com/external-secrets/external-secrets/runtime/template"
 )
 
@@ -73,6 +70,35 @@ func getTargetGVK(es *esv1.ExternalSecret) schema.GroupVersionKind {
 		Version: gv.Version,
 		Kind:    manifest.Kind,
 	}
+}
+
+// validateManifestSecretCandidate ensures rendering did not change the declared GVK
+// and applies the final Secret policy to explicit core/v1 Secret targets.
+func validateManifestSecretCandidate(es *esv1.ExternalSecret, obj *unstructured.Unstructured) error {
+	declaredGVK := getTargetGVK(es)
+	renderedGVK := obj.GroupVersionKind()
+
+	if renderedGVK != declaredGVK {
+		return fmt.Errorf(
+			"rendered target GVK %q differs from declared target GVK %q",
+			renderedGVK.String(),
+			declaredGVK.String(),
+		)
+	}
+
+	if declaredGVK != v1.SchemeGroupVersion.WithKind("Secret") {
+		return nil
+	}
+
+	secretType, _, err := unstructured.NestedString(obj.Object, "type")
+	if err != nil {
+		return fmt.Errorf("invalid Secret type: %w", err)
+	}
+
+	secret := &v1.Secret{Type: v1.SecretType(secretType)}
+	secret.SetAnnotations(obj.GetAnnotations())
+
+	return validateSecretCandidate(secret)
 }
 
 // getTargetName returns the name of the target resource.
@@ -242,62 +268,11 @@ func (r *Reconciler) applyTemplateToManifest(ctx context.Context, es *esv1.Exter
 	if err := r.applyOwnership(es, result); err != nil {
 		return nil, err
 	}
+	if err := validateManifestSecretCandidate(es, result); err != nil {
+		return nil, err
+	}
 
 	return result, nil
-}
-
-// applyOwnership manages the owner reference and owner label on the target manifest resource.
-func (r *Reconciler) applyOwnership(es *esv1.ExternalSecret, result *unstructured.Unstructured) error {
-	// get information about the current owner of the resource
-	//  - we ignore the API version as it can change over time
-	//  - we ignore the UID for consistency with the SetControllerReference function
-	currentOwner := metav1.GetControllerOf(result)
-	ownerIsESKind := false
-	ownerIsCurrentES := false
-	if currentOwner != nil {
-		currentOwnerGK := schema.FromAPIVersionAndKind(currentOwner.APIVersion, currentOwner.Kind).GroupKind()
-		ownerIsESKind = currentOwnerGK.String() == esv1.ExtSecretGroupKind
-		ownerIsCurrentES = ownerIsESKind && currentOwner.Name == es.Name
-	}
-
-	// if another ExternalSecret is the owner, we should return an error
-	// otherwise the controller will fight with itself to update the resource.
-	// note, this does not prevent other controllers from owning the resource.
-	if ownerIsESKind && !ownerIsCurrentES {
-		return fmt.Errorf("%w: %s", ErrSecretIsOwned, currentOwner.Name)
-	}
-
-	// if the CreationPolicy is Owner, we should set ourselves as the owner of the resource
-	if es.Spec.Target.CreationPolicy == esv1.CreatePolicyOwner {
-		if err := controllerutil.SetControllerReference(es, result, r.Scheme); err != nil {
-			return fmt.Errorf("%w: %w", ErrSecretSetCtrlRef, err)
-		}
-	}
-
-	// if the creation policy is not Owner, we should remove ourselves as the owner
-	// this could happen if the creation policy was changed after the resource was created
-	if es.Spec.Target.CreationPolicy != esv1.CreatePolicyOwner && ownerIsCurrentES {
-		if err := controllerutil.RemoveControllerReference(es, result, r.Scheme); err != nil {
-			return fmt.Errorf("%w: %w", ErrSecretRemoveCtrlRef, err)
-		}
-	}
-
-	labels := result.GetLabels()
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-
-	// we also use a label to keep track of the owner of the resource
-	// this lets us remove resources that are no longer needed if the target name changes
-	// the label should not be set if the creation policy is not Owner
-	if es.Spec.Target.CreationPolicy == esv1.CreatePolicyOwner {
-		labels[esv1.LabelOwner] = esutils.ObjectHash(fmt.Sprintf("%v/%v", es.Namespace, es.Name))
-	} else {
-		delete(labels, esv1.LabelOwner)
-	}
-	result.SetLabels(labels)
-
-	return nil
 }
 
 // createSimpleManifest creates a simple resource without templates (e.g., ConfigMap with data field).
@@ -345,7 +320,7 @@ func (r *Reconciler) renderTemplatedManifest(ctx context.Context, es *esv1.Exter
 			// Execute template directly against the unstructured object
 			out := make(map[string][]byte)
 			out[*tplFrom.Literal] = []byte(*tplFrom.Literal)
-			if err := execute(out, dataMap, esv1.TemplateScopeKeysAndValues, targetPath, obj); err != nil {
+			if err := execute(out, dataMap, esv1.TemplateScopeKeysAndValues, targetPath, obj, tplFrom.ValuesDecodingStrategy); err != nil {
 				return nil, fmt.Errorf("failed to execute literal template: %w", err)
 			}
 		}
@@ -373,7 +348,7 @@ func (r *Reconciler) renderTemplatedManifest(ctx context.Context, es *esv1.Exter
 			}
 
 			// apply collected data to the target object
-			if err := execute(tempSecret.Data, dataMap, esv1.TemplateScopeValues, targetPath, obj); err != nil {
+			if err := execute(tempSecret.Data, dataMap, esv1.TemplateScopeValues, targetPath, obj, esv1.ExternalSecretDecodeNone); err != nil {
 				return nil, fmt.Errorf("failed to apply merged templates to path %s: %w", targetPath, err)
 			}
 		}
@@ -386,7 +361,7 @@ func (r *Reconciler) renderTemplatedManifest(ctx context.Context, es *esv1.Exter
 			tplMap[k] = []byte(v)
 		}
 
-		if err := execute(tplMap, dataMap, esv1.TemplateScopeValues, esv1.TemplateTargetData, obj); err != nil {
+		if err := execute(tplMap, dataMap, esv1.TemplateScopeValues, esv1.TemplateTargetData, obj, esv1.ExternalSecretDecodeNone); err != nil {
 			return nil, fmt.Errorf("failed to execute template.data: %w", err)
 		}
 	}

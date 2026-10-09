@@ -3,6 +3,7 @@ package sprig
 import (
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -29,6 +30,14 @@ func base32encode(v string) string {
 
 func base32decode(v string) string {
 	data, err := base32.StdEncoding.DecodeString(v)
+	if err != nil {
+		return err.Error()
+	}
+	return string(data)
+}
+
+func hexdecode(v string) string {
+	data, err := hex.DecodeString(v)
 	if err != nil {
 		return err.Error()
 	}
@@ -114,8 +123,8 @@ func nindent(spaces int, v string) string {
 	return "\n" + indent(spaces, v)
 }
 
-func replace(old, new, src string) string {
-	return strings.Replace(src, old, new, -1)
+func replace(old, replacement, src string) string {
+	return strings.Replace(src, old, replacement, -1)
 }
 
 func plural(one, many string, count int) string {

@@ -26,7 +26,6 @@ import (
 	"github.com/tidwall/gjson"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
-	"github.com/external-secrets/external-secrets/runtime/constants"
 	"github.com/external-secrets/external-secrets/runtime/esutils"
 	"github.com/external-secrets/external-secrets/runtime/metrics"
 )
@@ -40,6 +39,8 @@ const (
 	errNotFound                     = "secret not found"
 	errSecretKeyFmt                 = "cannot find secret data for key: %q"
 )
+
+var systemMetadataKeys = []string{"created_time", "current_version", "delete_version_after"}
 
 // GetSecret supports two types:
 //  1. get the full secret as json-encoded value
@@ -131,7 +132,7 @@ func (c *client) readSecret(ctx context.Context, path, version string) (map[stri
 		params["version"] = []string{version}
 	}
 	vaultSecret, err := c.logical.ReadWithDataWithContext(ctx, dataPath, params)
-	metrics.ObserveAPICall(constants.ProviderHCVault, constants.CallHCVaultReadSecretData, err)
+	metrics.ObserveAPICall(ProviderHCVault, CallHCVaultReadSecretData, err)
 	if err != nil {
 		return nil, fmt.Errorf(errReadSecret, err)
 	}
@@ -193,23 +194,34 @@ func (c *client) readSecretMetadata(ctx context.Context, path string) (map[strin
 		return nil, err
 	}
 	secret, err := c.logical.ReadWithDataWithContext(ctx, url, nil)
-	metrics.ObserveAPICall(constants.ProviderHCVault, constants.CallHCVaultReadSecretData, err)
+	metrics.ObserveAPICall(ProviderHCVault, CallHCVaultReadSecretData, err)
 	if err != nil {
 		return nil, fmt.Errorf(errReadSecret, err)
 	}
 	if secret == nil {
 		return nil, errors.New(errNotFound)
 	}
+	if c.store.Version == esv1.VaultKVStoreV2 {
+		for _, key := range systemMetadataKeys {
+			if v, ok := secret.Data[key]; ok && v != nil {
+				metadata[key] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
 	t, ok := secret.Data["custom_metadata"]
 	if !ok {
-		return nil, nil
+		return metadata, nil
 	}
 	d, ok := t.(map[string]any)
 	if !ok {
 		return metadata, nil
 	}
 	for k, v := range d {
-		metadata[k] = v.(string)
+		if s, ok := v.(string); ok {
+			metadata[k] = s
+		} else {
+			metadata[k] = fmt.Sprintf("%v", v)
+		}
 	}
 	return metadata, nil
 }

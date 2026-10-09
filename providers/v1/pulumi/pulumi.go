@@ -36,6 +36,8 @@ type client struct {
 	project      string
 	environment  string
 	organization string
+	oidcManager  *OIDCTokenManager
+	store        *esv1.PulumiProvider
 }
 
 const (
@@ -51,12 +53,31 @@ const (
 
 var _ esv1.SecretsClient = &client{}
 
-func (c *client) GetSecret(_ context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
-	env, err := c.escClient.OpenEnvironment(c.authCtx, c.organization, c.project, c.environment)
+// getAuthContext returns the auth context for API calls.
+// For OIDC auth, it fetches a fresh token if needed (the OIDCTokenManager handles caching internally).
+// For static token auth, it returns the pre-configured auth context.
+// This method is safe for concurrent use as it doesn't mutate shared state.
+func (c *client) getAuthContext(ctx context.Context) (context.Context, error) {
+	if c.store != nil && c.store.Auth != nil && c.store.Auth.OIDCConfig != nil && c.oidcManager != nil {
+		token, err := c.oidcManager.GetToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get OIDC token: %w", err)
+		}
+		return esc.NewAuthContext(token), nil
+	}
+	return c.authCtx, nil
+}
+
+func (c *client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
+	authCtx, err := c.getAuthContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	value, _, err := c.escClient.ReadEnvironmentProperty(c.authCtx, c.organization, c.project, c.environment, env.GetId(), ref.Key)
+	env, err := c.escClient.OpenEnvironment(authCtx, c.organization, c.project, c.environment)
+	if err != nil {
+		return nil, err
+	}
+	value, _, err := c.escClient.ReadEnvironmentProperty(authCtx, c.organization, c.project, c.environment, env.GetId(), ref.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -85,29 +106,38 @@ func createSubmaps(input map[string]any) map[string]any {
 	return result
 }
 
-func (c *client) PushSecret(_ context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
+func (c *client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
+	authCtx, err := c.getAuthContext(ctx)
+	if err != nil {
+		return err
+	}
 	secretKey := data.GetSecretKey()
 	if secretKey == "" {
 		return errors.New(errPushWholeSecret)
 	}
 	value := secret.Data[secretKey]
 
-	updatePayload := &esc.EnvironmentDefinition{
-		Values: &esc.EnvironmentDefinitionValues{
-			AdditionalProperties: map[string]any{
-				data.GetRemoteKey(): string(value),
-			},
-		},
-	}
-	_, oldValues, err := c.escClient.OpenAndReadEnvironment(c.authCtx, c.organization, c.project, c.environment)
+	// Merge into the raw environment definition rather than the opened
+	// (resolved) environment, so imports, pulumiConfig, environmentVariables,
+	// files and fn:: expressions are written back untouched.
+	definition, _, err := c.escClient.GetEnvironment(authCtx, c.organization, c.project, c.environment)
 	if err != nil {
 		return fmt.Errorf(errReadEnvironment, err)
 	}
-	updatePayload.Values.AdditionalProperties = createSubmaps(updatePayload.Values.AdditionalProperties)
-	if err := mergo.Merge(&updatePayload.Values.AdditionalProperties, oldValues); err != nil {
+	if definition == nil {
+		definition = &esc.EnvironmentDefinition{}
+	}
+	if definition.Values == nil {
+		definition.Values = &esc.EnvironmentDefinitionValues{}
+	}
+	values := createSubmaps(map[string]any{
+		data.GetRemoteKey(): string(value),
+	})
+	if err := mergo.Merge(&values, definition.Values.AdditionalProperties); err != nil {
 		return fmt.Errorf(errPushSecrets, err)
 	}
-	_, err = c.escClient.UpdateEnvironment(c.authCtx, c.organization, c.project, c.environment, updatePayload)
+	definition.Values.AdditionalProperties = values
+	_, err = c.escClient.UpdateEnvironment(authCtx, c.organization, c.project, c.environment, definition)
 	if err != nil {
 		return fmt.Errorf(errPushSecrets, err)
 	}
@@ -147,12 +177,16 @@ func GetMapFromInterface(i any) (map[string][]byte, error) {
 	return result, nil
 }
 
-func (c *client) GetSecretMap(_ context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
-	env, err := c.escClient.OpenEnvironment(c.authCtx, c.organization, c.project, c.environment)
+func (c *client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	authCtx, err := c.getAuthContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	value, _, err := c.escClient.ReadEnvironmentProperty(c.authCtx, c.organization, c.project, c.environment, env.GetId(), ref.Key)
+	env, err := c.escClient.OpenEnvironment(authCtx, c.organization, c.project, c.environment)
+	if err != nil {
+		return nil, err
+	}
+	value, _, err := c.escClient.ReadEnvironmentProperty(authCtx, c.organization, c.project, c.environment, env.GetId(), ref.Key)
 	if err != nil {
 		return nil, err
 	}

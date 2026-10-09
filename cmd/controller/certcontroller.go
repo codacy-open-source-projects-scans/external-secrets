@@ -18,7 +18,6 @@ limitations under the License.
 package controller
 
 import (
-	"crypto/tls"
 	"os"
 	"time"
 
@@ -32,7 +31,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -79,10 +80,26 @@ var certcontrollerCmd = &cobra.Command{
 			BindAddress: metricsAddr,
 		}
 
-		// Disable HTTP/2 if not explicitly enabled
-		if !enableHTTP2 {
-			metricsServerOpts.TLSOpts = []func(*tls.Config){disableHTTP2}
+		if metricsSecure {
+			metricsServerOpts.SecureServing = true
+			metricsServerOpts.CertDir = metricsCertDir
+			metricsServerOpts.CertName = metricsCertName
+			metricsServerOpts.KeyName = metricsKeyName
 		}
+
+		if metricsAuth {
+			metricsServerOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
+		}
+		if metricsAuth && !metricsSecure {
+			setupLog.Error(nil, "--metrics-auth requires --metrics-secure; bearer tokens over plaintext HTTP is not allowed")
+			os.Exit(1)
+		}
+		metricsTLSOpts, err := buildTLSConfigFuncs(tlsCiphers, tlsMinVersion, tlsCurvePreferences, enableHTTP2)
+		if err != nil {
+			setupLog.Error(err, "unable to configure TLS for certcontroller metrics server")
+			os.Exit(1)
+		}
+		metricsServerOpts.TLSOpts = metricsTLSOpts
 
 		mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 			Scheme:  scheme,
@@ -136,6 +153,10 @@ var certcontrollerCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+			setupLog.Error(err, "unable to add cert controller healthz check")
+			os.Exit(1)
+		}
 		err = mgr.AddReadyzCheck("crd-inject", crdctrl.ReadyCheck)
 		if err != nil {
 			setupLog.Error(err, "unable to add crd readyz check")
@@ -182,6 +203,11 @@ func init() {
 
 	certcontrollerCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	certcontrollerCmd.Flags().StringVar(&healthzAddr, "healthz-addr", ":8081", "The address the health endpoint binds to.")
+	certcontrollerCmd.Flags().BoolVar(&metricsAuth, "metrics-auth", false, "Enable Kubernetes RBAC-based authentication and authorization for the metrics endpoint.")
+	certcontrollerCmd.Flags().BoolVar(&metricsSecure, "metrics-secure", false, "Enable HTTPS for the metrics endpoint.")
+	certcontrollerCmd.Flags().StringVar(&metricsCertDir, "metrics-cert-dir", "", "Directory containing TLS certificate and key for metrics endpoint.")
+	certcontrollerCmd.Flags().StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "TLS certificate filename for metrics endpoint.")
+	certcontrollerCmd.Flags().StringVar(&metricsKeyName, "metrics-key-name", "tls.key", "TLS key filename for metrics endpoint.")
 	certcontrollerCmd.Flags().StringVar(&serviceName, "service-name", "external-secrets-webhook", "Webhook service name")
 	certcontrollerCmd.Flags().StringVar(&serviceNamespace, "service-namespace", "default", "Webhook service namespace")
 	certcontrollerCmd.Flags().StringVar(&secretName, "secret-name", "external-secrets-webhook", "Secret to store certs for webhook")
@@ -196,6 +222,15 @@ func init() {
 	certcontrollerCmd.Flags().StringVar(&loglevel, "loglevel", "info", "loglevel to use, one of: debug, info, warn, error, dpanic, panic, fatal")
 	certcontrollerCmd.Flags().StringVar(&zapTimeEncoding, "zap-time-encoding", "epoch", "Zap time encoding (one of 'epoch', 'millis', 'nano', 'iso8601', 'rfc3339' or 'rfc3339nano')")
 	certcontrollerCmd.Flags().DurationVar(&crdRequeueInterval, "crd-requeue-interval", time.Minute*5, "Time duration between reconciling CRDs for new certs")
+	certcontrollerCmd.Flags().StringVar(&tlsCiphers, "tls-ciphers", "", "comma separated list of tls ciphers allowed for the metrics server. "+
+		"This does not apply to TLS 1.3 as the ciphers are selected automatically. "+
+		"Full lists of available ciphers can be found at https://pkg.go.dev/crypto/tls#pkg-constants")
+	certcontrollerCmd.Flags().StringVar(&tlsMinVersion, "tls-min-version", "", "minimum version of TLS supported for the metrics server. "+
+		"If not specified, Go's default minimum version is used. Valid values: 1.0, 1.1, 1.2, 1.3")
+	certcontrollerCmd.Flags().StringSliceVar(&tlsCurvePreferences, "tls-curve-preferences", nil,
+		"ordered list of TLS key exchange curves for the metrics server "+
+			"(for example X25519,CurveP256, or decimal tls.CurveID values supported by this Go toolchain). "+
+			"If omitted, Go defaults are used.")
 	certcontrollerCmd.Flags().BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
 }

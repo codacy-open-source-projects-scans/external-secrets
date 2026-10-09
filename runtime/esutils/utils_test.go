@@ -24,8 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/oracle/oci-go-sdk/v65/vault"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -38,9 +36,6 @@ import (
 )
 
 const (
-	base64DecodedValue         string = "foo%_?bar"
-	base64EncodedValue         string = "Zm9vJV8/YmFy"
-	base64URLEncodedValue      string = "Zm9vJV8_YmFy"
 	keyWithEmojis              string = "😀foo😁bar😂baz😈bing"
 	keyWithInvalidChars        string = "some-array[0].entity"
 	keyWithEncodedInvalidChars string = "some-array_U005b_0_U005d_.entity"
@@ -139,11 +134,6 @@ func TestIsNil(t *testing.T) {
 			exp:  false,
 		},
 		{
-			name: "oracle vault",
-			val:  vault.VaultsClient{},
-			exp:  false,
-		},
-		{
 			name: "func",
 			val: func() {
 				// noop for testing and to make linter happy
@@ -232,6 +222,31 @@ func TestConvertKeys(t *testing.T) {
 				"_U1f600_foo_U1f601_bar_U1f602_baz_U1f608_bing": []byte(`noop`),
 			},
 		},
+		{
+			// An omitted conversionStrategy must behave as Default, otherwise
+			// the key keeps characters a Secret cannot hold. See issue #6797.
+			name: "empty strategy converts as Default",
+			args: args{
+				strategy: "",
+				in: map[string][]byte{
+					"foo$bar%baz*bing": []byte(`noop`),
+				},
+			},
+			want: map[string][]byte{
+				"foo_bar_baz_bing": []byte(`noop`),
+			},
+		},
+		{
+			name: "empty strategy collides like Default",
+			args: args{
+				strategy: "",
+				in: map[string][]byte{
+					"foo$bar%baz*bing": []byte(`noop`),
+					"foo_bar_baz$bing": []byte(`noop`),
+				},
+			},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -242,6 +257,55 @@ func TestConvertKeys(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ConvertKeys() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransformKeys(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        map[string][]byte
+		transform func(string) string
+		want      map[string][]byte
+		wantErr   bool
+	}{
+		{
+			name: "transforms keys and preserves values",
+			in: map[string][]byte{
+				"foo": []byte("bar"),
+				"baz": []byte("qux"),
+			},
+			transform: func(key string) string {
+				return key + "-transformed"
+			},
+			want: map[string][]byte{
+				"foo-transformed": []byte("bar"),
+				"baz-transformed": []byte("qux"),
+			},
+		},
+		{
+			name: "errors on transformed key collision",
+			in: map[string][]byte{
+				"foo": []byte("bar"),
+				"baz": []byte("qux"),
+			},
+			transform: func(string) string {
+				return "collision"
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := transformKeys(tt.in, tt.transform)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("transformKeys() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("transformKeys() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -318,103 +382,6 @@ func TestReverseKeys(t *testing.T) {
 	}
 }
 
-func TestDecode(t *testing.T) {
-	type args struct {
-		strategy esv1.ExternalSecretDecodingStrategy
-		in       map[string][]byte
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    map[string][]byte
-		wantErr bool
-	}{
-		{
-			name: "base64 decoded",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeBase64,
-				in: map[string][]byte{
-					"foo": []byte("YmFy"),
-				},
-			},
-			want: map[string][]byte{
-				"foo": []byte("bar"),
-			},
-		},
-		{
-			name: "invalid base64",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeBase64,
-				in: map[string][]byte{
-					"foo": []byte("foo"),
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "base64url decoded",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeBase64URL,
-				in: map[string][]byte{
-					"foo": []byte(base64URLEncodedValue),
-				},
-			},
-			want: map[string][]byte{
-				"foo": []byte(base64DecodedValue),
-			},
-		},
-		{
-			name: "invalid base64url",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeBase64URL,
-				in: map[string][]byte{
-					"foo": []byte("foo"),
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "none",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeNone,
-				in: map[string][]byte{
-					"foo": []byte(base64URLEncodedValue),
-				},
-			},
-			want: map[string][]byte{
-				"foo": []byte(base64URLEncodedValue),
-			},
-		},
-		{
-			name: "auto",
-			args: args{
-				strategy: esv1.ExternalSecretDecodeAuto,
-				in: map[string][]byte{
-					"b64":        []byte(base64EncodedValue),
-					"invalidb64": []byte("foo"),
-					"b64url":     []byte(base64URLEncodedValue),
-				},
-			},
-			want: map[string][]byte{
-				"b64":        []byte(base64DecodedValue),
-				"invalidb64": []byte("foo"),
-				"b64url":     []byte(base64DecodedValue),
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := DecodeMap(tt.args.strategy, tt.args.in)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("DecodeMap() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("DecodeMap() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
 func TestValidate(t *testing.T) {
 	err := NetworkValidate("http://google.com", 10*time.Second)
 	if err != nil {
@@ -972,6 +939,35 @@ func TestFetchValueFromMetadata(t *testing.T) {
 	}
 }
 
+func TestJSONToSecretDataMap(t *testing.T) {
+	t.Run("string values", func(t *testing.T) {
+		got, err := JSONToSecretDataMap([]byte(`{"foo":"bar"}`))
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]byte{"foo": []byte("bar")}, got)
+	})
+
+	t.Run("nested and non-string values", func(t *testing.T) {
+		got, err := JSONToSecretDataMap([]byte(`{"username":"my_user","port":5432,"nested":{"baz":"nestedval"}}`))
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]byte{
+			"username": []byte("my_user"),
+			"port":     []byte("5432"),
+			"nested":   []byte(`{"baz":"nestedval"}`),
+		}, got)
+	})
+
+	t.Run("null value", func(t *testing.T) {
+		got, err := JSONToSecretDataMap([]byte(`{"key":null}`))
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]byte{"key": []byte("")}, got)
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		_, err := JSONToSecretDataMap([]byte(`not-json`))
+		assert.Error(t, err)
+	})
+}
+
 func TestGetByteValue(t *testing.T) {
 	type args struct {
 		data any
@@ -1088,7 +1084,7 @@ func TestCompareStringAndByteSlices(t *testing.T) {
 		{
 			name: "same contents",
 			args: args{
-				stringValue:    aws.String("value"),
+				stringValue:    new("value"),
 				byteValueSlice: []byte("value"),
 			},
 			want:    true,
@@ -1096,7 +1092,7 @@ func TestCompareStringAndByteSlices(t *testing.T) {
 		}, {
 			name: "different contents",
 			args: args{
-				stringValue:    aws.String("value89"),
+				stringValue:    new("value89"),
 				byteValueSlice: []byte("value"),
 			},
 			want:    true,
@@ -1104,7 +1100,7 @@ func TestCompareStringAndByteSlices(t *testing.T) {
 		}, {
 			name: "same contents with random",
 			args: args{
-				stringValue:    aws.String("value89!3#@212"),
+				stringValue:    new("value89!3#@212"),
 				byteValueSlice: []byte("value89!3#@212"),
 			},
 			want:    true,
@@ -1466,7 +1462,7 @@ func TestFetchCACertFromSourceRejectsCrossNamespaceCAProviderConfigMapForSecretS
 			Type:      esv1.CAProviderTypeConfigMap,
 			Name:      "ca-cm",
 			Key:       "ca.crt",
-			Namespace: Ptr("other"),
+			Namespace: new("other"),
 		},
 		StoreKind: esv1.SecretStoreKind,
 		Namespace: "default",
@@ -1504,7 +1500,7 @@ func TestFetchCACertFromSourceRejectsCrossNamespaceCAProviderSecretForSecretStor
 			Type:      esv1.CAProviderTypeSecret,
 			Name:      "ca-secret",
 			Key:       "tls.crt",
-			Namespace: Ptr("other"),
+			Namespace: new("other"),
 		},
 		StoreKind: esv1.SecretStoreKind,
 		Namespace: "default",

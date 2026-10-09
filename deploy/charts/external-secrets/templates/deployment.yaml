@@ -69,7 +69,6 @@ spec:
           {{- end }}
           image: {{ include "external-secrets.image" (dict "chartAppVersion" .Chart.AppVersion "image" .Values.image "context" .) | trim }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if or (.Values.leaderElect) (.Values.scopedNamespace) (.Values.processClusterStore) (.Values.processClusterExternalSecret) (.Values.processClusterPushSecret) (.Values.concurrent) (.Values.extraArgs) }}
           args:
           {{- if .Values.leaderElect }}
           - --enable-leader-election=true
@@ -77,10 +76,19 @@ spec:
           {{- if .Values.leaderElectionID }}
           - --leader-election-id={{ .Values.leaderElectionID }}
           {{- end }}
-          {{- if .Values.scopedNamespace }}
-          - --namespace={{ .Values.scopedNamespace }}
+          {{- if .Values.leaderElectionLeaseDuration }}
+          - --leader-election-lease-duration={{ .Values.leaderElectionLeaseDuration }}
           {{- end }}
-          {{- if and .Values.scopedNamespace .Values.scopedRBAC }}
+          {{- if .Values.leaderElectionRenewDeadline }}
+          - --leader-election-renew-deadline={{ .Values.leaderElectionRenewDeadline }}
+          {{- end }}
+          {{- if .Values.leaderElectionRetryPeriod }}
+          - --leader-election-retry-period={{ .Values.leaderElectionRetryPeriod }}
+          {{- end }}
+          {{- if or .Values.scopedNamespace .Values.scopedRBAC }}
+          - --namespace={{ .Values.scopedNamespace | default .Release.Namespace }}
+          {{- end }}
+          {{- if .Values.scopedRBAC }}
           - --enable-cluster-store-reconciler=false
           - --enable-cluster-external-secret-reconciler=false
           - --enable-cluster-push-secret-reconciler=false
@@ -101,6 +109,9 @@ spec:
           {{- if not .Values.processSecretStore }}
           - --enable-secret-store-reconciler=false
           {{- end }}
+          {{- if .Values.storeRequeueInterval }}
+          - --store-requeue-interval={{ .Values.storeRequeueInterval }}
+          {{- end }}
           {{- if .Values.controllerClass }}
           - --controller-class={{ .Values.controllerClass }}
           {{- end }}
@@ -109,6 +120,15 @@ spec:
           {{- end }}
           {{- if .Values.enableHTTP2 }}
           - --enable-http2=true
+          {{- end }}
+          {{- if .Values.tls.minVersion }}
+          - --tls-min-version={{ .Values.tls.minVersion }}
+          {{- end }}
+          {{- if .Values.tls.ciphers }}
+          - --tls-ciphers={{ .Values.tls.ciphers }}
+          {{- end }}
+          {{- if .Values.tls.curvePreferences }}
+          - --tls-curve-preferences={{ join "," .Values.tls.curvePreferences }}
           {{- end }}
           {{- if .Values.vault.enableTokenCache }}
           - --enable-vault-token-cache=true
@@ -129,7 +149,6 @@ spec:
           - --{{ $key }}
             {{- end }}
           {{- end }}
-          {{- end }}
           - --metrics-addr=:{{ .Values.metrics.listen.port }}
           - --loglevel={{ .Values.log.level }}
           - --zap-time-encoding={{ .Values.log.timeEncoding }}
@@ -145,6 +164,9 @@ spec:
           - --metrics-cert-dir={{ .Values.metrics.listen.secure.certDir }}
           - --metrics-cert-name={{ .Values.metrics.listen.secure.certFile }}
           - --metrics-key-name={{ .Values.metrics.listen.secure.keyFile }}
+          {{- end }}
+          {{- if .Values.metrics.listen.auth.enabled }}
+          - --metrics-auth=true
           {{- end }}
           ports:
             - containerPort: {{ .Values.metrics.listen.port }}
@@ -224,6 +246,12 @@ spec:
       {{- end }}
       {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      {{- if .Values.schedulerName }}
+      schedulerName: {{ .Values.schedulerName | quote }}
+      {{- end }}
+      {{- if .Values.runtimeClassName }}
+      runtimeClassName: {{ .Values.runtimeClassName | quote }}
       {{- end }}
       {{- if .Values.podSpecExtra }}
       {{- toYaml .Values.podSpecExtra | nindent 6 }}

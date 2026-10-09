@@ -44,7 +44,11 @@ data:
 Then create a simple k/v pair at path `secret/foo`:
 
 ```
+# Creates the secret data
 vault kv put secret/foo my-value=s3cr3t
+
+# Creates custom metadata used by the metadataPolicy: Fetch example below
+vault kv metadata put -custom-metadata='dev=development' secret/foo
 ```
 
 Can check kv version using following and check for `Options` column, it should indicate [version:2]:
@@ -99,6 +103,17 @@ spec:
 ```
 
 Keep in mind that fetching the labels with `metadataPolicy: Fetch` only works with KV sercrets engine version v2.
+
+In addition to the labels defined under `custom_metadata`, `metadataPolicy: Fetch` also exposes the following system metadata of the secret: `created_time`, `current_version` and `delete_version_after`. All values are returned as strings. If a `custom_metadata` label uses the same name as one of these keys, the `custom_metadata` value takes precedence.
+
+```yaml
+  # metadataPolicy to fetch the current version of the secret
+  - secretKey: version
+    remoteRef:
+      metadataPolicy: Fetch
+      key: foo
+      property: current_version
+```
 
 #### Fetching Raw Values
 
@@ -575,11 +590,13 @@ external-secrets --enable-vault-token-cache --vault-token-cache-size=262144
 #### When to Use Token Caching
 
 Token caching is beneficial when:
+
 - Using authentication methods that generate short-lived tokens (e.g., AppRole, Kubernetes auth)
 - Running multiple ExternalSecrets that use the same SecretStore
 - Experiencing high token generation overhead
 
 Token caching should **not** be used when:
+
 - Using static tokens (no performance benefit)
 - Security requirements mandate fresh tokens for each request
 - Memory usage is a concern

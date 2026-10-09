@@ -18,7 +18,9 @@ package controller
 
 import (
 	"crypto/tls"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -51,6 +54,7 @@ import (
 	"github.com/external-secrets/external-secrets/pkg/controllers/secretstore"
 	"github.com/external-secrets/external-secrets/pkg/controllers/secretstore/cssmetrics"
 	"github.com/external-secrets/external-secrets/pkg/controllers/secretstore/ssmetrics"
+	"github.com/external-secrets/external-secrets/runtime/esutils"
 	"github.com/external-secrets/external-secrets/runtime/feature"
 
 	// To allow using gcp auth.
@@ -65,6 +69,7 @@ var (
 	liveAddr                              string
 	metricsAddr                           string
 	metricsSecure                         bool
+	metricsAuth                           bool
 	metricsCertDir                        string
 	metricsCertName                       string
 	metricsKeyName                        string
@@ -72,6 +77,9 @@ var (
 	controllerClass                       string
 	enableLeaderElection                  bool
 	leaderElectionID                      string
+	leaderElectionLeaseDuration           time.Duration
+	leaderElectionRenewDeadline           time.Duration
+	leaderElectionRetryPeriod             time.Duration
 	enableSecretsCache                    bool
 	enableConfigMapsCache                 bool
 	enableManagedSecretsCache             bool
@@ -101,6 +109,7 @@ var (
 	certLookaheadInterval                 time.Duration
 	tlsCiphers                            string
 	tlsMinVersion                         string
+	tlsCurvePreferences                   []string
 	enableHTTP2                           bool
 	allowGenericTargets                   bool
 )
@@ -155,11 +164,19 @@ var rootCmd = &cobra.Command{
 			metricsOpts.CertName = metricsCertName
 			metricsOpts.KeyName = metricsKeyName
 		}
-
-		// Disable HTTP/2 if not explicitly enabled
-		if !enableHTTP2 {
-			metricsOpts.TLSOpts = []func(*tls.Config){disableHTTP2}
+		if metricsAuth {
+			metricsOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
 		}
+		if metricsAuth && !metricsSecure {
+			setupLog.Error(nil, "--metrics-auth requires --metrics-secure; bearer tokens over plaintext HTTP is not allowed")
+			os.Exit(1)
+		}
+		metricsTLSOpts, err := buildTLSConfigFuncs(tlsCiphers, tlsMinVersion, tlsCurvePreferences, enableHTTP2)
+		if err != nil {
+			setupLog.Error(err, "unable to configure TLS for metrics server")
+			os.Exit(1)
+		}
+		metricsOpts.TLSOpts = metricsTLSOpts
 		mgrOpts := ctrl.Options{
 			Scheme:                 scheme,
 			Metrics:                metricsOpts,
@@ -174,6 +191,9 @@ var rootCmd = &cobra.Command{
 			},
 			LeaderElection:   enableLeaderElection,
 			LeaderElectionID: leaderElectionID,
+			LeaseDuration:    &leaderElectionLeaseDuration,
+			RenewDeadline:    &leaderElectionRenewDeadline,
+			RetryPeriod:      &leaderElectionRetryPeriod,
 		}
 		if namespace != "" {
 			mgrOpts.Cache.DefaultNamespaces = map[string]cache.Config{
@@ -328,6 +348,7 @@ func Execute() {
 
 func init() {
 	rootCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
+	rootCmd.Flags().BoolVar(&metricsAuth, "metrics-auth", false, "Enable Kubernetes RBAC-based authentication and authorization for the metrics endpoint.")
 	rootCmd.Flags().BoolVar(&metricsSecure, "metrics-secure", false, "Enable HTTPS for the metrics endpoint.")
 	rootCmd.Flags().StringVar(&metricsCertDir, "metrics-cert-dir", "", "Directory containing TLS certificate and key for metrics endpoint.")
 	rootCmd.Flags().StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "TLS certificate filename for metrics endpoint.")
@@ -338,6 +359,12 @@ func init() {
 			"Enabling this will ensure there is only one active controller manager.")
 	rootCmd.Flags().StringVar(&leaderElectionID, "leader-election-id", "external-secrets-controller",
 		"The ID of the lease object used for leader election. Set this to a unique value when running multiple deployments in the same namespace.")
+	rootCmd.Flags().DurationVar(&leaderElectionLeaseDuration, "leader-election-lease-duration", 15*time.Second,
+		"The duration that non-leader candidates will wait to force acquire leadership. This is measured against time of last observed ack.")
+	rootCmd.Flags().DurationVar(&leaderElectionRenewDeadline, "leader-election-renew-deadline", 10*time.Second,
+		"The interval between attempts by the acting leader to renew its leadership before it stops leading. This must be less than the lease duration.")
+	rootCmd.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 2*time.Second,
+		"The duration the clients should wait between attempting acquisition and renewal of a leadership.")
 	rootCmd.Flags().IntVar(&concurrent, "concurrent", 1, "The number of concurrent reconciles.")
 	rootCmd.Flags().Float32Var(&clientQPS, "client-qps", 50, "QPS configuration to be passed to rest.Client")
 	rootCmd.Flags().IntVar(&clientBurst, "client-burst", 100, "Maximum Burst allowed to be passed to rest.Client")
@@ -364,6 +391,15 @@ func init() {
 	rootCmd.Flags().BoolVar(&enableFloodGate, "enable-flood-gate", true, "Enable flood gate. External secret will be reconciled only if the ClusterStore or Store have an healthy or unknown state.")
 	rootCmd.Flags().BoolVar(&enableGeneratorState, "enable-generator-state", true, "Whether the Controller should manage GeneratorState")
 	rootCmd.Flags().BoolVar(&enableExtendedMetricLabels, "enable-extended-metric-labels", false, "Enable recommended kubernetes annotations as labels in metrics.")
+	rootCmd.Flags().StringVar(&tlsCiphers, "tls-ciphers", "", "comma separated list of tls ciphers allowed for the metrics server. "+
+		"This does not apply to TLS 1.3 as the ciphers are selected automatically. "+
+		"Full lists of available ciphers can be found at https://pkg.go.dev/crypto/tls#pkg-constants")
+	rootCmd.Flags().StringVar(&tlsMinVersion, "tls-min-version", "", "minimum version of TLS supported for the metrics server. "+
+		"If not specified, Go's default minimum version is used. Valid values: 1.0, 1.1, 1.2, 1.3")
+	rootCmd.Flags().StringSliceVar(&tlsCurvePreferences, "tls-curve-preferences", nil,
+		"ordered list of TLS key exchange curves for the metrics server "+
+			"(for example X25519,CurveP256, or decimal tls.CurveID values supported by this Go toolchain). "+
+			"If omitted, Go defaults are used.")
 	rootCmd.Flags().BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
 	rootCmd.Flags().
@@ -377,4 +413,68 @@ func init() {
 // disableHTTP2 is a TLS configuration function that disables HTTP/2.
 func disableHTTP2(cfg *tls.Config) {
 	cfg.NextProtos = []string{"http/1.1"}
+}
+
+// parseTLSCurvePreferences converts human-readable curve names to tls.CurveID values.
+// It accepts well-known names (X25519, CurveP256, CurveP384, CurveP521 and aliases)
+// as well as decimal tls.CurveID values for forward-compat with new Go toolchains.
+func parseTLSCurvePreferences(names []string) ([]tls.CurveID, error) {
+	filtered := make([]string, 0, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		filtered = append(filtered, n)
+	}
+	if len(filtered) == 0 {
+		return nil, nil
+	}
+	return esutils.ParseCurvePreferences(filtered)
+}
+
+// buildTLSConfigFuncs assembles a slice of tls.Config mutators from the current
+// flag values. It is shared across all subcommands (controller, webhook, certcontroller).
+func buildTLSConfigFuncs(ciphers, minVer string, curves []string, http2 bool) ([]func(*tls.Config), error) {
+	var opts []func(*tls.Config)
+
+	if !http2 {
+		opts = append(opts, disableHTTP2)
+	}
+
+	if ciphers != "" {
+		ids, err := getTLSCipherSuitesIDs(ciphers)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse tls ciphers: %w", err)
+		}
+		if len(ids) > 0 {
+			opts = append(opts, func(cfg *tls.Config) {
+				cfg.CipherSuites = ids
+			})
+		}
+	}
+
+	if minVer != "" {
+		ver, err := tlsVersion(minVer)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse tls min version: %w", err)
+		}
+		opts = append(opts, func(cfg *tls.Config) {
+			cfg.MinVersion = ver
+		})
+	}
+
+	if len(curves) > 0 {
+		curveIDs, err := parseTLSCurvePreferences(curves)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse tls curve preferences: %w", err)
+		}
+		if len(curveIDs) > 0 {
+			opts = append(opts, func(cfg *tls.Config) {
+				cfg.CurvePreferences = curveIDs
+			})
+		}
+	}
+
+	return opts, nil
 }

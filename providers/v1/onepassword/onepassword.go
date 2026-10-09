@@ -115,8 +115,6 @@ func (provider *ProviderOnePassword) Capabilities() esv1.SecretStoreCapabilities
 
 // NewClient constructs a 1Password Provider.
 func (provider *ProviderOnePassword) NewClient(ctx context.Context, store esv1.GenericStore, kube kclient.Client, namespace string) (esv1.SecretsClient, error) {
-	provider.mu.Lock()
-	defer provider.mu.Unlock()
 	config := store.GetSpec().Provider.OnePassword
 	token, err := resolvers.SecretKeyRef(
 		ctx,
@@ -128,9 +126,10 @@ func (provider *ProviderOnePassword) NewClient(ctx context.Context, store esv1.G
 	if err != nil {
 		return nil, err
 	}
-	provider.client = newRetryClient(connect.NewClientWithUserAgent(config.ConnectHost, token, userAgent))
-	provider.vaults = config.Vaults
-	return provider, nil
+	return &ProviderOnePassword{
+		client: newRetryClient(connect.NewClientWithUserAgent(config.ConnectHost, token, userAgent)),
+		vaults: config.Vaults,
+	}, nil
 }
 
 // ValidateStore checks if the provided store is valid.
@@ -241,8 +240,30 @@ func (provider *ProviderOnePassword) DeleteSecret(_ context.Context, ref esv1.Pu
 }
 
 // SecretExists checks if a secret exists in 1Password.
-func (provider *ProviderOnePassword) SecretExists(_ context.Context, _ esv1.PushSecretRemoteRef) (bool, error) {
-	return false, errors.New("not implemented")
+func (provider *ProviderOnePassword) SecretExists(_ context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+
+	item, err := provider.findItem(ref.GetRemoteKey())
+	if errors.Is(err, ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	property := ref.GetProperty()
+	if property == "" {
+		return true, nil
+	}
+
+	for _, field := range item.Fields {
+		if field.Label == property {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 const (

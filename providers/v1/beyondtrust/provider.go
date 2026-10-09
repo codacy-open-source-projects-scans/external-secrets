@@ -49,6 +49,8 @@ const (
 	errMissingProvider      = "storeSpec is missing provider"
 	errInvalidProvider      = "invalid provider spec. Missing field in store %s"
 	errInvalidHostURL       = "invalid host URL"
+	errMissingAuthMethod    = "no authentication method configured: set auth.apiKey, or auth.clientId and auth.clientSecret"
+	errIncompleteOAuth      = "both clientId and clientSecret must be set for OAuth authentication"
 	errNoSuchKeyFmt         = "no such key in secret: %q"
 	errInvalidRetrievalPath = "invalid retrieval path. Provide one path, separator and name"
 	errNotImplemented       = "not implemented"
@@ -63,6 +65,7 @@ const (
 	ownerTypeFieldName   = "owner_type"
 	secretTypeFieldName  = "secret_type"
 	secretTypeCredential = "CREDENTIAL"
+	secretTypeSecret     = "SECRET"
 )
 
 var (
@@ -340,7 +343,7 @@ func (p *Provider) GetAllSecrets(_ context.Context, _ esv1.ExternalSecretFind) (
 // GetSecret reads the secret from the Password Safe server and returns it. The controller uses the value here to
 // create the Kubernetes secret.
 func (p *Provider) GetSecret(_ context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
-	managedAccountType := !strings.EqualFold(p.retrievaltype, "SECRET")
+	managedAccountType := !strings.EqualFold(p.retrievaltype, secretTypeSecret)
 
 	retrievalPaths := utils.ValidatePaths([]string{ref.Key}, managedAccountType, p.separator, &p.log)
 
@@ -400,24 +403,73 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 		return nil, fmt.Errorf(errInvalidProvider, store.GetObjectMeta().String())
 	}
 
+	if provider.Server == nil {
+		return nil, errors.New(errInvalidHostURL)
+	}
+
 	apiURL, err := url.Parse(provider.Server.APIURL)
-	if err != nil {
+	if err != nil || apiURL.Host == "" {
 		return nil, errors.New(errInvalidHostURL)
 	}
 
-	if provider.Auth.ClientID.SecretRef != nil {
-		return nil, err
+	if provider.Auth == nil {
+		return nil, errors.New(errMissingAuthMethod)
 	}
 
-	if provider.Auth.ClientSecret.SecretRef != nil {
-		return nil, err
+	// Auth method requirements must stay in sync with loadCredentialsFromConfig.
+	switch {
+	case provider.Auth.APIKey != nil:
+		if err := validateAuthRef(store, "apiKey", provider.Auth.APIKey); err != nil {
+			return nil, err
+		}
+	case provider.Auth.ClientID != nil && provider.Auth.ClientSecret != nil:
+		if err := validateAuthRef(store, "clientId", provider.Auth.ClientID); err != nil {
+			return nil, err
+		}
+		if err := validateAuthRef(store, "clientSecret", provider.Auth.ClientSecret); err != nil {
+			return nil, err
+		}
+	case provider.Auth.ClientID != nil || provider.Auth.ClientSecret != nil:
+		return nil, errors.New(errIncompleteOAuth)
+	default:
+		return nil, errors.New(errMissingAuthMethod)
 	}
 
-	if apiURL.Host == "" {
-		return nil, errors.New(errInvalidHostURL)
+	// loadCertificateFromConfig silently ignores an incomplete certificate pair,
+	// so warn instead of rejecting the store.
+	var warnings admission.Warnings
+	hasCertificate := provider.Auth.Certificate != nil
+	hasCertificateKey := provider.Auth.CertificateKey != nil
+	if hasCertificate != hasCertificateKey {
+		warnings = append(warnings, "certificate and certificateKey must both be set for client-certificate authentication; the incomplete pair is ignored")
+	}
+	if hasCertificate {
+		if err := validateAuthRef(store, "certificate", provider.Auth.Certificate); err != nil {
+			return warnings, err
+		}
+	}
+	if hasCertificateKey {
+		if err := validateAuthRef(store, "certificateKey", provider.Auth.CertificateKey); err != nil {
+			return warnings, err
+		}
 	}
 
-	return nil, nil
+	return warnings, nil
+}
+
+func validateAuthRef(store esv1.GenericStore, field string, ref *esv1.BeyondTrustProviderSecretRef) error {
+	if ref.SecretRef == nil && ref.Value == "" {
+		return fmt.Errorf("%s: either secretRef or value must be set", field)
+	}
+	if err := validateSecretRef(ref); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	if ref.SecretRef != nil {
+		if err := esutils.ValidateReferentSecretSelector(store, *ref.SecretRef); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+	}
+	return nil
 }
 
 // NewProvider creates a new Provider instance.
@@ -519,86 +571,47 @@ func (p *Provider) CreateSecret(secret string, data map[string]any, signAppinRes
 		Notes:       notes,
 	}
 
-	var configMap map[string]any
+	// Build a version-neutral input per secret type; CreateSecretFlow
+	// selects Config30/Config31 from p.authenticate.ApiVersion internally.
+	var secretInput any
 	switch strings.ToUpper(secretType) {
-	case "CREDENTIAL":
-
-		secretCredentialDetailsConfig30 := entities.SecretCredentialDetailsConfig30{
+	case secretTypeCredential:
+		secretInput = entities.SecretCredentialInput{
 			SecretDetailsBaseConfig: secretDetailsConfig,
 			Username:                username,
 			Password:                secret,
 			OwnerId:                 ownerID,
 			OwnerType:               ownerType,
-			Owners:                  ownerDetailsOwnerID,
-		}
-
-		secretCredentialDetailsConfig31 := entities.SecretCredentialDetailsConfig31{
-			SecretDetailsBaseConfig: secretDetailsConfig,
-			Username:                username,
-			Password:                secret,
-			Owners:                  ownerDetailsGroupID,
-		}
-
-		configMap = map[string]any{
-			"3.0": secretCredentialDetailsConfig30,
-			"3.1": secretCredentialDetailsConfig31,
+			OwnersByOwnerId:         ownerDetailsOwnerID,
+			OwnersByGroupId:         ownerDetailsGroupID,
 		}
 
 	case "FILE":
-
-		secretFileDetailsConfig30 := entities.SecretFileDetailsConfig30{
+		secretInput = entities.SecretFileInput{
 			SecretDetailsBaseConfig: secretDetailsConfig,
-			FileContent:             secret,
 			FileName:                fileName,
+			FileContent:             secret,
 			OwnerId:                 ownerID,
 			OwnerType:               ownerType,
-			Owners:                  ownerDetailsOwnerID,
-		}
-
-		secretFileDetailsConfig31 := entities.SecretFileDetailsConfig31{
-			SecretDetailsBaseConfig: secretDetailsConfig,
-			FileContent:             secret,
-			FileName:                fileName,
-			Owners:                  ownerDetailsGroupID,
-		}
-
-		configMap = map[string]any{
-			"3.0": secretFileDetailsConfig30,
-			"3.1": secretFileDetailsConfig31,
+			OwnersByOwnerId:         ownerDetailsOwnerID,
+			OwnersByGroupId:         ownerDetailsGroupID,
 		}
 
 	case "TEXT":
-
-		secretTextDetailsConfig30 := entities.SecretTextDetailsConfig30{
+		secretInput = entities.SecretTextInput{
 			SecretDetailsBaseConfig: secretDetailsConfig,
 			Text:                    secret,
 			OwnerId:                 ownerID,
 			OwnerType:               ownerType,
-			Owners:                  ownerDetailsOwnerID,
-		}
-
-		secretTextDetailsConfig31 := entities.SecretTextDetailsConfig31{
-			SecretDetailsBaseConfig: secretDetailsConfig,
-			Text:                    secret,
-			Owners:                  ownerDetailsGroupID,
-		}
-
-		configMap = map[string]any{
-			"3.0": secretTextDetailsConfig30,
-			"3.1": secretTextDetailsConfig31,
+			OwnersByOwnerId:         ownerDetailsOwnerID,
+			OwnersByGroupId:         ownerDetailsGroupID,
 		}
 
 	default:
 		return fmt.Errorf("Unknown secret type")
 	}
 
-	secretDetails, exists := configMap[p.authenticate.ApiVersion]
-
-	if !exists {
-		return fmt.Errorf("unsupported API version: %v", &p.authenticate.ApiVersion)
-	}
-
-	_, err = secretObj.CreateSecretFlow(folderName, secretDetails)
+	_, err = secretObj.CreateSecretFlow(folderName, secretInput)
 
 	if err != nil {
 		return err
